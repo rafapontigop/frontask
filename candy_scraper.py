@@ -11,12 +11,9 @@ Usage:
 """
 
 import asyncio
-import os
 import re
-import time
-import json
 from pathlib import Path
-from urllib.parse import urlparse, unquote
+from urllib.parse import urlparse
 from typing import Optional, Dict, List
 
 import requests
@@ -28,25 +25,20 @@ BASE_URL = "https://candy.ai"
 OUTPUT_DIR = Path.home() / "Desktop"
 
 LIVE_ACTION_CHARACTERS = [
-    "coco-bailey",
-    "darkangel666",
-    "emilia-vermont",
-    "elodie-valmont",
-    "mila-nowak",
-    "isabella-torres",
-    "olivia-carter",
-    "katarina-sommerfeld",
-    "luna-moreno-2",
-    "irina-konstantinov",
-]
-
-CDN_PATTERNS = [
-    "private-cdn.candy.ai/videos/",
-    "cdn.candy.ai/",
+    ("coco-bailey", "Coco"),
+    ("darkangel666", "Darkangel666"),
+    ("emilia-vermont", "Emilia"),
+    ("elodie-valmont", "Elodie"),
+    ("mila-nowak", "Mila"),
+    ("isabella-torres", "Isabella"),
+    ("olivia-carter", "Olivia"),
+    ("katarina-sommerfeld", "Katarina"),
+    ("luna-moreno-2", "Luna"),
+    ("irina-konstantinov", "Irina"),
 ]
 
 VIDEO_CONTENT_TYPES = {"video/mp4", "video/webm", "application/octet-stream"}
-MIN_VIDEO_SIZE = 200 * 1024  # 200 KB - skip thumbnails/previews
+MIN_VIDEO_SIZE = 200 * 1024  # 200 KB
 
 MAX_CHARACTERS_PHASE2 = 100
 
@@ -54,25 +46,17 @@ MAX_CHARACTERS_PHASE2 = 100
 # -- Helpers -----------------------------------------------------------------
 
 def slugify(text: str) -> str:
-    """Convert action text to a safe filename."""
     text = text.strip()
     text = re.sub(r"[^\w\s-]", "", text)
     text = re.sub(r"[\s]+", "_", text)
     return text
 
 
-def prettify_name(slug: str) -> str:
-    """Convert URL slug to a readable folder name."""
-    return slug.replace("-", " ").title().replace(" 2", " 2")
-
-
 def is_cdn_video_url(url: str) -> bool:
-    """Check if URL matches Candy.ai CDN video patterns."""
-    return any(pattern in url for pattern in CDN_PATTERNS)
+    return "private-cdn.candy.ai/videos/" in url or "cdn.candy.ai/" in url
 
 
 def download_file(url: str, dest: Path, cookies: Optional[Dict] = None):
-    """Download a file using requests with cookie auth."""
     dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.exists() and dest.stat().st_size > MIN_VIDEO_SIZE:
         print(f"    [skip] Already exists: {dest.name}")
@@ -103,137 +87,122 @@ def download_file(url: str, dest: Path, cookies: Optional[Dict] = None):
 
 
 async def extract_cookies(context: BrowserContext) -> dict:
-    """Extract cookies from browser context for requests session."""
     cookies = await context.cookies()
     return {c["name"]: c["value"] for c in cookies}
 
 
 # -- Phase 1: Live Action ----------------------------------------------------
 
-async def scrape_live_action(page: Page, slug: str, cookies: dict):
-    """Scrape all free live-action video clips for one character."""
-    char_name = prettify_name(slug)
-    out_dir = OUTPUT_DIR / "Live Action" / char_name
-    out_dir.mkdir(parents=True, exist_ok=True)
+async def find_action_rows(page: Page) -> List[dict]:
+    """
+    Find the action rows in the right panel.
 
-    url = f"{BASE_URL}/ai-girlfriend/{slug}/live-actions?source=home_live_section"
-    print(f"\n{'='*60}")
-    print(f"  LIVE ACTION -- {char_name}")
-    print(f"  {url}")
-    print(f"{'='*60}")
+    Each row is structured as:
+      [ text label ]                    [ pink circle play button ]
+      e.g. "Tease me"                         (pink circle)
 
-    try:
-        await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
-    except Exception as e:
-        print(f"  [FAIL] Could not load page: {e}")
-        return
+    Locked rows instead show:
+      [ text label ]              [ lock icon ]  "Level N"
 
-    await page.wait_for_timeout(3000)
-
-    # -- Step 1: Click "Tap to start" to initialize the Live Action player --
-    # This overlay appears before the action buttons become interactive.
-    tap_clicked = False
-    for text_pattern in ["Tap to start", "TAP TO START", "tap to start",
-                         "Click to start", "Start"]:
-        try:
-            locator = page.get_by_text(text_pattern, exact=False).first
-            if await locator.is_visible(timeout=2000):
-                print(f"  Found '{text_pattern}' -- clicking to initialize player...")
-                await locator.click(timeout=5000)
-                tap_clicked = True
-                await page.wait_for_timeout(3000)
-                break
-        except Exception:
-            continue
-
-    if not tap_clicked:
-        # Try clicking any large overlay/splash element covering the video area
-        try:
-            overlay = page.locator("[class*='overlay'], [class*='splash'], [class*='start']").first
-            if await overlay.is_visible(timeout=2000):
-                await overlay.click()
-                await page.wait_for_timeout(3000)
-                print("  Clicked overlay element to start player")
-        except Exception:
-            print("  No 'Tap to start' overlay found -- player may already be active")
-
-    # -- Step 2: Find action buttons in the RIGHT panel ----------------------
-    # The right panel has action cards, each with:
-    #   - A text label ("Tease me", "Show me your butt", etc.)
-    #   - A pink circular play button with a white triangle/play SVG icon
-    #
-    # Strategy: find elements in the right half of the viewport that have
-    # a play-icon SVG and a short text label. We use position-based filtering
-    # to avoid picking up navigation, sidebar, and header elements.
-
-    action_items = await page.evaluate("""
+    We detect FREE rows by finding rows that contain an SVG inside a
+    pink/rose-colored circular element (the play button), and do NOT
+    contain "Level" text on the right side.
+    """
+    return await page.evaluate("""
         () => {
             const results = [];
-            const vw = window.innerWidth;
-            const vh = window.innerHeight;
 
-            // Gather ALL elements that could be action buttons
-            // We look for clickable things with SVG icons in the right portion of the page
-            const candidates = document.querySelectorAll(
-                'button, [role="button"], div[class*="cursor-pointer"], div[class*="clickable"]'
-            );
+            // The action rows are in the right panel.
+            // Each row has: a text label + either a pink play button OR a lock + "Level N"
+            //
+            // Strategy: find all SVG elements that are inside a pink/rose circle.
+            // The pink play button is a circle (border-radius: 50%) with a pink/rose
+            // background, containing an SVG with a play triangle (polygon).
+            // Then walk up to the parent row to get the action text.
 
-            for (const el of candidates) {
-                const rect = el.getBoundingClientRect();
+            // Approach: find every element that looks like a row containing
+            // both text and a circular pink button.
+            // The rows are siblings in a scrollable list in the right panel.
 
-                // Must be visible and reasonably sized
-                if (rect.width < 30 || rect.height < 30) continue;
-                if (rect.top < 0 || rect.bottom > vh + 100) continue;
+            // First, let's find all elements with pink/rose background that contain SVG
+            const allElements = document.querySelectorAll('*');
+            const playButtons = [];
 
-                // Skip tiny or huge elements
-                if (rect.width > 600 || rect.height > 200) continue;
+            for (const el of allElements) {
+                const style = window.getComputedStyle(el);
+                const bg = style.backgroundColor;
+                const br = style.borderRadius;
 
-                // Check for SVG play icon inside (circle + polygon, or path with play shape)
+                // Check if this is a circle (border-radius ~50% or high px)
+                const isCircular = br.includes('50%') || br.includes('9999') ||
+                    parseInt(br) >= 20;
+                if (!isCircular) continue;
+
+                // Check if background is pink/rose (high R, medium-low G and B)
+                const rgbMatch = bg.match(/rgba?\\((\\d+),\\s*(\\d+),\\s*(\\d+)/);
+                if (!rgbMatch) continue;
+                const r = parseInt(rgbMatch[1]);
+                const g = parseInt(rgbMatch[2]);
+                const b = parseInt(rgbMatch[3]);
+
+                // Pink/rose: R > 180, G < 130, B < 160 (covers various pink shades)
+                const isPink = r > 180 && g < 130 && b < 160;
+                if (!isPink) continue;
+
+                // Must contain an SVG (the play triangle icon)
                 const svg = el.querySelector('svg');
-                const hasPlayClass = el.querySelector('[class*="play"], [class*="Play"]');
-                if (!svg && !hasPlayClass) continue;
+                if (!svg) continue;
 
-                // Get the text content (just direct/shallow text, not deeply nested)
-                let text = '';
-                const textNodes = el.querySelectorAll('span, p, div, h3, h4, h5, label');
-                for (const tn of textNodes) {
-                    const t = tn.textContent.trim();
-                    if (t.length >= 3 && t.length <= 50) { text = t; break; }
+                playButtons.push(el);
+            }
+
+            // For each pink play button, walk up to find the parent row and extract text
+            for (const btn of playButtons) {
+                // Walk up max 5 levels to find the row container
+                let row = btn.parentElement;
+                for (let i = 0; i < 5 && row; i++) {
+                    const rect = row.getBoundingClientRect();
+                    // A row should be wider than tall, and reasonably sized
+                    if (rect.width > 200 && rect.height > 30 && rect.height < 120) {
+                        break;
+                    }
+                    row = row.parentElement;
                 }
-                if (!text) {
-                    text = el.textContent.trim().split('\\n')[0].trim();
+
+                if (!row) continue;
+
+                // Extract the text label (should be the action name)
+                // Get text NOT inside the button itself
+                let actionText = '';
+                const textElements = row.querySelectorAll('span, p, div, h3, h4, h5');
+                for (const te of textElements) {
+                    // Skip if this is inside the pink button
+                    if (btn.contains(te)) continue;
+                    const t = te.textContent.trim();
+                    if (t.length >= 3 && t.length <= 60 && !t.includes('Level')) {
+                        actionText = t;
+                        break;
+                    }
                 }
-                if (!text || text.length < 3 || text.length > 60) continue;
 
-                // Skip known non-action UI elements
-                const lower = text.toLowerCase();
-                const skipWords = [
-                    'discord', 'companion', 'creative', 'token', 'english',
-                    'login', 'sign up', 'sign in', 'menu', 'close', 'back',
-                    'home', 'settings', 'profile', 'chat', 'message', 'send',
-                    'hi,', 'hello', 'hey', 'subscribe', 'upgrade', 'premium',
-                    'free trial', 'cookie', 'accept', 'decline', 'cancel',
-                    'tap to start', 'click to start'
-                ];
-                if (skipWords.some(w => lower.startsWith(w) || lower === w)) continue;
+                if (!actionText) {
+                    // Fallback: get all text from row, remove button text
+                    const rowText = row.textContent.trim();
+                    const btnText = btn.textContent.trim();
+                    actionText = rowText.replace(btnText, '').trim().split('\\n')[0].trim();
+                }
 
-                // Check for lock/premium indicators (skip locked actions)
-                const html = el.innerHTML.toLowerCase();
-                const isLocked = (
-                    html.includes('lock') ||
-                    html.includes('locked') ||
-                    html.includes('premium') ||
-                    el.querySelector('[class*="lock"], [class*="Lock"]') !== null
-                );
+                if (!actionText || actionText.length < 3 || actionText.length > 60) continue;
 
+                // Skip UI noise
+                const lower = actionText.toLowerCase();
+                if (['level', 'skip to', 'xp', 'beta'].some(w => lower.startsWith(w))) continue;
+
+                const btnRect = btn.getBoundingClientRect();
                 results.push({
-                    text: text,
-                    x: Math.round(rect.x),
-                    y: Math.round(rect.y),
-                    w: Math.round(rect.width),
-                    h: Math.round(rect.height),
-                    isLocked: isLocked,
-                    tag: el.tagName
+                    text: actionText,
+                    btnX: Math.round(btnRect.x + btnRect.width / 2),
+                    btnY: Math.round(btnRect.y + btnRect.height / 2),
                 });
             }
 
@@ -248,41 +217,64 @@ async def scrape_live_action(page: Page, slug: str, cookies: dict):
         }
     """)
 
-    # Filter locked vs free
-    free_actions = [a for a in action_items if not a.get("isLocked")]
-    locked_actions = [a for a in action_items if a.get("isLocked")]
 
-    for a in locked_actions:
-        print(f"  [LOCKED] {a['text']}")
+async def scrape_live_action(page: Page, slug: str, char_name: str, cookies: dict):
+    """Scrape all free live-action video clips for one character."""
+    out_dir = OUTPUT_DIR / "Live Action" / char_name
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    if not free_actions:
-        # Take a debug screenshot and dump page structure
-        debug_path = out_dir / "_debug_screenshot.png"
-        await page.screenshot(path=str(debug_path), full_page=True)
-        print(f"  [WARN] No free action buttons found.")
-        print(f"         Debug screenshot: {debug_path}")
-        print(f"         All candidates found: {len(action_items)}")
-        for a in action_items:
-            print(f"           - '{a['text']}' at ({a['x']},{a['y']}) locked={a['isLocked']}")
+    url = f"{BASE_URL}/ai-girlfriend/{slug}/live-actions?source=home_live_section"
+    print(f"\n{'='*60}")
+    print(f"  {char_name}")
+    print(f"  {url}")
+    print(f"{'='*60}")
+
+    try:
+        await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+    except Exception as e:
+        print(f"  [FAIL] Could not load page: {e}")
         return
 
-    print(f"  Found {len(free_actions)} free actions:")
-    for a in free_actions:
-        print(f"    - '{a['text']}' at ({a['x']},{a['y']})")
+    await page.wait_for_timeout(3000)
 
-    # -- Step 3: Click each action, intercept video, download ----------------
-    for idx, action_info in enumerate(free_actions):
-        action_text = action_info["text"]
-        action_filename = slugify(action_text) + ".mp4"
-        dest = out_dir / action_filename
-
-        if dest.exists() and dest.stat().st_size > MIN_VIDEO_SIZE:
-            print(f"  [{idx+1}/{len(free_actions)}] [skip] Already have: {action_text}")
+    # -- Step 1: Click "Tap to start" if present -----------------------------
+    for text_pattern in ["Tap to start", "TAP TO START", "tap to start"]:
+        try:
+            loc = page.get_by_text(text_pattern, exact=False).first
+            if await loc.is_visible(timeout=2000):
+                print(f"  Clicking '{text_pattern}'...")
+                await loc.click(timeout=5000)
+                await page.wait_for_timeout(3000)
+                break
+        except Exception:
             continue
 
-        print(f"  [{idx+1}/{len(free_actions)}] Clicking: '{action_text}'")
+    # -- Step 2: Find the pink play buttons ----------------------------------
+    actions = await find_action_rows(page)
 
-        # Set up response listener BEFORE clicking
+    if not actions:
+        debug_path = out_dir / "_debug.png"
+        await page.screenshot(path=str(debug_path), full_page=True)
+        print(f"  [WARN] No action buttons found. Screenshot: {debug_path}")
+        return
+
+    print(f"  Found {len(actions)} free actions:")
+    for a in actions:
+        print(f"    - {a['text']}")
+
+    # -- Step 3: Click each pink play button, intercept video, download ------
+    for idx, action in enumerate(actions):
+        action_text = action["text"]
+        filename = slugify(action_text) + ".mp4"
+        dest = out_dir / filename
+
+        if dest.exists() and dest.stat().st_size > MIN_VIDEO_SIZE:
+            print(f"  [{idx+1}/{len(actions)}] [skip] {action_text}")
+            continue
+
+        print(f"  [{idx+1}/{len(actions)}] {action_text}")
+
+        # Set up response interceptor BEFORE clicking
         captured_url = None
         capture_event = asyncio.Event()
 
@@ -300,39 +292,39 @@ async def scrape_live_action(page: Page, slug: str, cookies: dict):
                     captured_url = resp_url
                     capture_event.set()
             except Exception:
-                if "/videos/" in resp_url and any(resp_url.endswith(ext) for ext in [".mp4", ".webm"]):
+                if "/videos/" in resp_url:
                     captured_url = resp_url
                     capture_event.set()
 
         page.on("response", on_response)
 
-        # Reset the video player before clicking next action
+        # Reset video player before clicking
         try:
             await page.evaluate("""
                 () => {
-                    const videos = document.querySelectorAll('video');
-                    videos.forEach(v => { v.pause(); v.removeAttribute('src'); v.load(); });
+                    document.querySelectorAll('video').forEach(v => {
+                        v.pause();
+                        v.removeAttribute('src');
+                        v.load();
+                    });
                 }
             """)
         except Exception:
             pass
 
-        # Click the action button by coordinates (most reliable since we
-        # already know exact position from the evaluate step)
+        # Click the pink play button at its exact coordinates
         try:
-            cx = action_info["x"] + action_info["w"] // 2
-            cy = action_info["y"] + action_info["h"] // 2
-            await page.mouse.click(cx, cy)
+            await page.mouse.click(action["btnX"], action["btnY"])
         except Exception as e:
             print(f"    [WARN] Click failed: {e}")
             page.remove_listener("response", on_response)
             continue
 
-        # Wait for video URL to appear in network traffic (up to 8s)
+        # Wait for CDN video response (up to 8s)
         try:
             await asyncio.wait_for(capture_event.wait(), timeout=8.0)
         except asyncio.TimeoutError:
-            # Fallback: read video src from DOM
+            # Fallback: check <video> src in DOM
             try:
                 video_src = await page.evaluate("""
                     () => {
@@ -342,33 +334,32 @@ async def scrape_live_action(page: Page, slug: str, cookies: dict):
                 """)
                 if video_src and is_cdn_video_url(video_src):
                     captured_url = video_src
-                    print(f"    [DOM fallback] Got URL from <video> element")
+                    print(f"    [DOM fallback]")
             except Exception:
                 pass
 
         page.remove_listener("response", on_response)
 
         if captured_url:
-            short_url = captured_url.split("?")[0][-60:]
-            print(f"    [URL] ...{short_url}")
+            short = captured_url.split("?")[0].split("/")[-1]
+            print(f"    -> {short}")
             download_file(captured_url, dest, cookies)
         else:
-            print(f"    [WARN] No video URL captured for: {action_text}")
+            print(f"    [WARN] No video captured")
 
-        # Pause between actions to let player settle
+        # Pause before next click
         await page.wait_for_timeout(2000)
 
 
 async def run_phase1(context: BrowserContext, cookies: dict):
-    """Phase 1: Scrape live action videos for all characters."""
     print("\n" + "=" * 60)
-    print("  PHASE 1 -- LIVE ACTION SCRAPING")
+    print("  PHASE 1 -- LIVE ACTION")
     print("=" * 60)
 
     page = await context.new_page()
 
-    for slug in LIVE_ACTION_CHARACTERS:
-        await scrape_live_action(page, slug, cookies)
+    for slug, char_name in LIVE_ACTION_CHARACTERS:
+        await scrape_live_action(page, slug, char_name, cookies)
 
     await page.close()
     print("\n  Phase 1 complete!")
@@ -377,18 +368,15 @@ async def run_phase1(context: BrowserContext, cookies: dict):
 # -- Phase 2: Character Profiles ---------------------------------------------
 
 async def collect_character_urls(page: Page) -> List[str]:
-    """Collect up to MAX_CHARACTERS_PHASE2 character profile URLs from homepage."""
     print("\n  Collecting character URLs from homepage...")
 
     await page.goto(BASE_URL, wait_until="domcontentloaded", timeout=30_000)
     await page.wait_for_timeout(3000)
 
-    # Scroll down to load more characters
     for _ in range(10):
         await page.evaluate("window.scrollBy(0, window.innerHeight)")
         await page.wait_for_timeout(1000)
 
-    # Extract all character profile links
     links = await page.evaluate("""
         () => {
             const anchors = document.querySelectorAll('a[href]');
@@ -406,7 +394,6 @@ async def collect_character_urls(page: Page) -> List[str]:
         }
     """)
 
-    # Filter in Python: valid slugs only
     valid = []
     for url in links:
         parsed = urlparse(url)
@@ -423,9 +410,8 @@ async def collect_character_urls(page: Page) -> List[str]:
 
 
 async def scrape_character_profile(page: Page, profile_url: str, cookies: dict):
-    """Scrape all CDN assets (images + videos) from a character profile page."""
     slug = profile_url.rstrip("/").split("/")[-1]
-    char_name = prettify_name(slug)
+    char_name = slug.replace("-", " ").title()
     base_dir = OUTPUT_DIR / "Candy AI Characters" / char_name
     img_dir = base_dir / "imagenes"
     vid_dir = base_dir / "videos"
@@ -452,31 +438,27 @@ async def scrape_character_profile(page: Page, profile_url: str, cookies: dict):
             await page.wait_for_timeout(800)
 
     except Exception as e:
-        print(f"    [FAIL] Could not load profile: {e}")
+        print(f"    [FAIL] Could not load: {e}")
         page.remove_listener("response", on_response)
         return
 
-    # Scan DOM for CDN image/video URLs we might have missed
     dom_urls = await page.evaluate("""
         () => {
             const urls = new Set();
             document.querySelectorAll('img[src]').forEach(el => {
-                if (el.src.includes('cdn.candy.ai') || el.src.includes('private-cdn.candy.ai')) {
+                if (el.src.includes('cdn.candy.ai') || el.src.includes('private-cdn.candy.ai'))
                     urls.add(el.src + '|image');
-                }
             });
             document.querySelectorAll('video source[src], video[src]').forEach(el => {
                 const src = el.src || el.getAttribute('src');
-                if (src && (src.includes('cdn.candy.ai') || src.includes('private-cdn.candy.ai'))) {
+                if (src && (src.includes('cdn.candy.ai') || src.includes('private-cdn.candy.ai')))
                     urls.add(src + '|video');
-                }
             });
             document.querySelectorAll('[style*="background"]').forEach(el => {
                 const style = el.getAttribute('style') || '';
-                const match = style.match(/url\\(['"]?(https?:\\/\\/[^'"\\)]+)['"]?\\)/);
-                if (match && (match[1].includes('cdn.candy.ai') || match[1].includes('private-cdn.candy.ai'))) {
-                    urls.add(match[1] + '|image');
-                }
+                const m = style.match(/url\\(['"]?(https?:\\/\\/[^'"\\)]+)['"]?\\)/);
+                if (m && (m[1].includes('cdn.candy.ai') || m[1].includes('private-cdn.candy.ai')))
+                    urls.add(m[1] + '|image');
             });
             return [...urls];
         }
@@ -489,7 +471,6 @@ async def scrape_character_profile(page: Page, profile_url: str, cookies: dict):
         ct = "image/jpeg" if kind == "image" else "video/mp4"
         captured_assets.append((url, ct))
 
-    # Deduplicate
     seen = set()
     unique_assets = []
     for url, ct in captured_assets:
@@ -499,7 +480,7 @@ async def scrape_character_profile(page: Page, profile_url: str, cookies: dict):
             unique_assets.append((url, ct))
 
     if not unique_assets:
-        print(f"    [WARN] No assets found for {char_name}")
+        print(f"    [WARN] No assets found")
         return
 
     img_count = vid_count = 0
@@ -523,9 +504,8 @@ async def scrape_character_profile(page: Page, profile_url: str, cookies: dict):
 
 
 async def run_phase2(context: BrowserContext, cookies: dict):
-    """Phase 2: Scrape character profile assets."""
     print("\n" + "=" * 60)
-    print("  PHASE 2 -- CHARACTER PROFILE SCRAPING")
+    print("  PHASE 2 -- CHARACTER PROFILES")
     print("=" * 60)
 
     page = await context.new_page()
@@ -553,7 +533,7 @@ async def main():
             args=["--disable-blink-features=AutomationControlled"],
         )
         context = await browser.new_context(
-            viewport={"width": 1280, "height": 900},
+            viewport={"width": 1400, "height": 900},
             user_agent=(
                 "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -563,7 +543,7 @@ async def main():
         page = await context.new_page()
         await page.goto(BASE_URL, wait_until="domcontentloaded")
 
-        print("Log in to Candy.ai then press ENTER.")
+        print("Log in to Candy.ai in the browser window.")
         print()
         input("Press ENTER once logged in... ")
 
