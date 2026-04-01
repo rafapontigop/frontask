@@ -2,8 +2,8 @@
 """
 Candy.ai Live Action Scraper
 
-For each character: navigate to /live-actions, click every request row,
-if a video plays -> download it. If not (paywall popup) -> dismiss and move on.
+For each character: navigate to /live-actions, click each request by name,
+intercept the video from private-cdn.candy.ai/videos/, download it.
 """
 
 import asyncio
@@ -16,16 +16,52 @@ BASE_URL = "https://candy.ai"
 OUTPUT_DIR = Path.home() / "Desktop" / "Live Action"
 
 CHARACTERS = [
-    ("coco-bailey", "Coco"),
-    ("darkangel666", "Darkangel666"),
-    ("emilia-vermont", "Emilia"),
-    ("elodie-valmont", "Elodie"),
-    ("mila-nowak", "Mila"),
-    ("isabella-torres", "Isabella"),
-    ("olivia-carter", "Olivia"),
-    ("katarina-sommerfeld", "Katarina"),
-    ("luna-moreno-2", "Luna"),
-    ("irina-konstantinov", "Irina"),
+    ("coco-bailey", "Coco", [
+        "Tease me", "Show me your butt", "Make an ahegao face",
+        "Show me your boobs", "Kiss another girl", "Get naked for me",
+    ]),
+    ("darkangel666", "Darkangel666", [
+        "I tease you slowly", "Pull an ahegao Face", "Dance for me",
+        "Show me your butt", "Kiss another girl",
+    ]),
+    ("emilia-vermont", "Emilia", [
+        "Ahegao face", "Panty tease", "Get on all fours", "Undress",
+        "Beg me", "Rub your tits", "Squirt", "Handjob", "Boobjob",
+        "Blowjob", "Missionary",
+    ]),
+    ("elodie-valmont", "Elodie", [
+        "Ahegao Face", "Sexy Tease", "Undress", "Show Feet",
+        "Spread Ass", "Squirt for me", "Cowgirl Anal",
+    ]),
+    ("mila-nowak", "Mila", [
+        "Sexy Strech", "Kissing (Another girl)", "Undress",
+        "Boobjob & Facial", "Pussy Play & Squirt", "BBC",
+    ]),
+    ("isabella-torres", "Isabella", [
+        "Airjob", "Ahegao Face", "Kissing (Another Girl)", "Undress",
+        "Show Ass", "Boobjob",
+    ]),
+    ("olivia-carter", "Olivia", [
+        "Smile for me", "Blow a bubble", "Sexy Dance for me",
+        "Pull an ahegao face", "Undress for me", "Kiss another girl",
+        "Show me your ass", "Show me anal",
+    ]),
+    ("katarina-sommerfeld", "Katarina", [
+        "Sexy tease", "Show butt", "Flash boobs", "Undress",
+        "Spread ass", "Boobjob", "Missionary", "Anal creampie",
+    ]),
+    ("luna-moreno-2", "Luna", [
+        "Sexy tease", "Show panties", "Lick Lollipop", "Ahegao face",
+        "Flash Boobs", "Undress", "Show ass", "Sexy Dance",
+        "Hand Job", "Boob job", "Bukkake", "Cowgirl",
+    ]),
+    ("irina-konstantinov", "Irina", [
+        "Dance for me", "Smile", "Come closer", "Undress",
+        "Ahegao face", "Show ass", "Striptease", "Hand job",
+        "Blow job", "Spank ass", "Show pussy", "Touch yourself",
+        "Dildo", "Squirt", "Footjob", "Fuck pussy", "Anal",
+        "Threesome", "Doggy backshot",
+    ]),
 ]
 
 VIDEO_CONTENT_TYPES = {"video/mp4", "video/webm", "application/octet-stream"}
@@ -45,7 +81,7 @@ def download(url, dest, cookies):
     dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.exists() and dest.stat().st_size > MIN_VIDEO_SIZE:
         print(f"      [skip] already have {dest.name}")
-        return
+        return True
     s = requests.Session()
     for k, v in cookies.items():
         s.cookies.set(k, v)
@@ -61,120 +97,109 @@ def download(url, dest, cookies):
                 f.write(chunk)
         mb = dest.stat().st_size / (1024 * 1024)
         print(f"      [OK] {dest.name} ({mb:.1f} MB)")
+        return True
     except Exception as e:
         print(f"      [FAIL] {dest.name}: {e}")
         if dest.exists():
             dest.unlink()
+        return False
+
+
+async def click_action_by_text(page, action_name):
+    """
+    Find and click a request row by its action text.
+    Searches the right panel for an element containing the action name,
+    then clicks it. Returns True if clicked successfully.
+    """
+    # Use page.evaluate to find the element by text in the right panel
+    coords = await page.evaluate("""
+        (actionName) => {
+            const normalizedTarget = actionName.toLowerCase().trim();
+            const allElements = document.querySelectorAll('div, button, a, li, span');
+            let bestMatch = null;
+            let bestArea = Infinity;
+
+            for (const el of allElements) {
+                const rect = el.getBoundingClientRect();
+
+                // Must be in the right panel area
+                if (rect.left < 700) continue;
+                if (rect.width < 200 || rect.height < 30) continue;
+                if (rect.height > 80) continue;
+
+                // Get text, normalize it
+                const rawText = el.textContent.trim();
+                const normalized = rawText.toLowerCase()
+                    .replace(/free$/i, '').replace(/request$/i, '')
+                    .replace(/\\d+$/, '').trim();
+
+                // Check if this element's text matches our target
+                if (normalized === normalizedTarget ||
+                    normalized.startsWith(normalizedTarget) ||
+                    normalizedTarget.startsWith(normalized)) {
+
+                    // Prefer the smallest matching element (most specific)
+                    const area = rect.width * rect.height;
+                    if (area < bestArea) {
+                        bestArea = area;
+                        bestMatch = {
+                            x: Math.round(rect.x + rect.width / 2),
+                            y: Math.round(rect.y + rect.height / 2),
+                            found: rawText.substring(0, 50)
+                        };
+                    }
+                }
+            }
+            return bestMatch;
+        }
+    """, action_name)
+
+    if not coords:
+        return False
+
+    await page.mouse.click(coords["x"], coords["y"])
+    return True
 
 
 async def dismiss_popups(page):
-    """Close any paywall/token popup that might appear after clicking a paid request."""
-    try:
-        # Try clicking any X/close button that appeared
-        for selector in [
-            "button:has-text('Close')",
-            "button:has-text('close')",
-            "[aria-label='Close']",
-            "[aria-label='close']",
-            "button:has-text('Cancel')",
-            "button:has-text('No thanks')",
-            "button:has-text('Maybe later')",
-        ]:
-            loc = page.locator(selector).first
-            if await loc.is_visible(timeout=500):
-                await loc.click(timeout=2000)
-                await page.wait_for_timeout(500)
-                return True
-    except Exception:
-        pass
-
-    # Try pressing Escape
+    """Try to close any popup that might have appeared."""
     try:
         await page.keyboard.press("Escape")
         await page.wait_for_timeout(500)
     except Exception:
         pass
-
-    # Click outside any modal (top-left corner of the page)
+    for sel in ["button:has-text('Close')", "button:has-text('Cancel')",
+                "button:has-text('No thanks')", "button:has-text('Maybe later')",
+                "[aria-label='Close']"]:
+        try:
+            loc = page.locator(sel).first
+            if await loc.is_visible(timeout=300):
+                await loc.click(timeout=1000)
+                await page.wait_for_timeout(300)
+        except Exception:
+            pass
     try:
         await page.mouse.click(100, 100)
-        await page.wait_for_timeout(500)
+        await page.wait_for_timeout(300)
     except Exception:
         pass
 
-    return False
 
-
-async def get_request_rows(page):
-    """
-    Find ALL request rows in the right panel.
-    Each row has an action name like "Tease me", "Dance for me", etc.
-    No filtering -- we click them all and see what happens.
-    """
-    return await page.evaluate("""
-        () => {
-            const rows = [];
-            const seen = new Set();
-            const allDivs = document.querySelectorAll('div, li, a, button');
-
-            for (const el of allDivs) {
-                const rect = el.getBoundingClientRect();
-
-                // Right panel rows: x > 700, reasonable row size
-                if (rect.left < 700) continue;
-                if (rect.width < 250 || rect.width > 500) continue;
-                if (rect.height < 35 || rect.height > 80) continue;
-
-                const text = el.textContent.trim();
-                if (text.length < 3 || text.length > 100) continue;
-
-                // Extract action name: first line, strip trailing noise
-                let name = text.split('\\n')[0].trim();
-                // Remove trailing "Free", "Request", or numbers
-                name = name.replace(/\\s*(Free|Request|\\d+)\\s*$/i, '').trim();
-                if (name.length < 3) continue;
-
-                // Skip non-action rows
-                const lower = name.toLowerCase();
-                if (lower.includes('live action')) continue;
-                if (lower.includes('tokens balance')) continue;
-                if (lower.includes('get tokens')) continue;
-                if (lower.includes('skip to level')) continue;
-                if (lower.includes('beta')) continue;
-                if (lower.match(/^\\d+\\s*\\/\\s*\\d+/)) continue;  // "5 / 200 XP"
-                if (lower.match(/^level\\s*\\d+$/)) continue;
-
-                // Deduplicate
-                const key = name.toLowerCase();
-                if (seen.has(key)) continue;
-                seen.add(key);
-
-                rows.push({
-                    name: name,
-                    x: Math.round(rect.x + rect.width / 2),
-                    y: Math.round(rect.y + rect.height / 2),
-                });
-            }
-            return rows;
-        }
-    """)
-
-
-async def scrape_character(page, slug, char_name, cookies):
+async def scrape_character(page, slug, char_name, actions, cookies):
     url = f"{BASE_URL}/ai-girlfriend/{slug}/live-actions?source=home_live_section"
     out_dir = OUTPUT_DIR / char_name
 
     print(f"\n{'='*60}")
-    print(f"  {char_name}")
+    print(f"  {char_name} ({len(actions)} actions)")
     print(f"{'='*60}")
 
     try:
         await page.goto(url, wait_until="domcontentloaded", timeout=30000)
     except Exception as e:
-        print(f"  [FAIL] {e}")
+        print(f"  [FAIL] Page load: {e}")
         return
 
-    await page.wait_for_timeout(4000)
+    await page.wait_for_timeout(3000)
 
     # Click "Tap to start" if present
     for pat in ["Tap to start", "TAP TO START"]:
@@ -188,103 +213,148 @@ async def scrape_character(page, slug, char_name, cookies):
         except Exception:
             continue
 
-    rows = await get_request_rows(page)
-
-    if not rows:
-        print(f"  [WARN] No request rows found on page")
-        return
-
-    print(f"  Found {len(rows)} requests:")
-    for r in rows:
-        print(f"    - {r['name']}")
-
     out_dir.mkdir(parents=True, exist_ok=True)
-    downloaded = 0
+    ok_count = 0
 
-    for idx, row in enumerate(rows):
-        name = row["name"]
-        fname = slugify(name) + ".mp4"
+    for idx, action_name in enumerate(actions):
+        fname = slugify(action_name) + ".mp4"
         dest = out_dir / fname
 
         if dest.exists() and dest.stat().st_size > MIN_VIDEO_SIZE:
-            print(f"    [{idx+1}/{len(rows)}] [skip] {name}")
-            downloaded += 1
+            print(f"  [{idx+1}/{len(actions)}] [skip] {action_name}")
+            ok_count += 1
             continue
 
-        print(f"    [{idx+1}/{len(rows)}] {name} ...", end=" ", flush=True)
+        print(f"  [{idx+1}/{len(actions)}] {action_name} ...", end=" ", flush=True)
 
-        # Set up network interceptor BEFORE clicking
+        # --- Set up interceptor BEFORE clicking ---
         captured_url = None
-        event = asyncio.Event()
+        capture_event = asyncio.Event()
 
-        async def on_resp(resp):
-            nonlocal captured_url
-            if captured_url:
-                return
-            u = resp.url
-            if not is_cdn_video(u):
-                return
-            try:
-                ct = resp.headers.get("content-type", "")
-                cl = resp.headers.get("content-length", "0")
-                if ct in VIDEO_CONTENT_TYPES or int(cl) > MIN_VIDEO_SIZE:
-                    captured_url = u
-                    event.set()
-            except Exception:
-                if "/videos/" in u:
-                    captured_url = u
-                    event.set()
+        def make_handler(cap_event):
+            """Create a fresh handler with its own closure."""
+            captured = {"url": None}
 
-        page.on("response", on_resp)
+            async def handler(resp):
+                if captured["url"]:
+                    return
+                u = resp.url
+                if not is_cdn_video(u):
+                    return
+                try:
+                    ct = resp.headers.get("content-type", "")
+                    cl = resp.headers.get("content-length", "0")
+                    if ct in VIDEO_CONTENT_TYPES or int(cl) > MIN_VIDEO_SIZE:
+                        captured["url"] = u
+                        cap_event.set()
+                except Exception:
+                    if "/videos/" in u:
+                        captured["url"] = u
+                        cap_event.set()
 
-        # Reset video player
+            return handler, captured
+
+        handler, captured_ref = make_handler(capture_event)
+        page.on("response", handler)
+
+        # --- Reset video player ---
         try:
-            await page.evaluate("""
-                () => { document.querySelectorAll('video').forEach(v => {
+            await page.evaluate("""() => {
+                document.querySelectorAll('video').forEach(v => {
                     v.pause(); v.removeAttribute('src'); v.load();
-                }); }
-            """)
+                });
+            }""")
         except Exception:
             pass
 
-        # Click the request row
+        # --- Scroll the action into view and click it ---
+        # First scroll the right panel to top to reset
         try:
-            await page.mouse.click(row["x"], row["y"])
-        except Exception as e:
-            print(f"click failed: {e}")
-            page.remove_listener("response", on_resp)
+            await page.evaluate("""() => {
+                const panels = document.querySelectorAll('div');
+                for (const p of panels) {
+                    const r = p.getBoundingClientRect();
+                    if (r.left > 700 && r.height > 300 && p.scrollHeight > p.clientHeight) {
+                        p.scrollTop = 0;
+                    }
+                }
+            }""")
+            await page.wait_for_timeout(300)
+        except Exception:
+            pass
+
+        clicked = await click_action_by_text(page, action_name)
+
+        if not clicked:
+            # Maybe need to scroll down in the right panel to find it
+            try:
+                await page.evaluate("""() => {
+                    const panels = document.querySelectorAll('div');
+                    for (const p of panels) {
+                        const r = p.getBoundingClientRect();
+                        if (r.left > 700 && r.height > 300 && p.scrollHeight > p.clientHeight) {
+                            p.scrollBy(0, 300);
+                        }
+                    }
+                }""")
+                await page.wait_for_timeout(500)
+            except Exception:
+                pass
+            clicked = await click_action_by_text(page, action_name)
+
+        if not clicked:
+            # Scroll more
+            try:
+                await page.evaluate("""() => {
+                    const panels = document.querySelectorAll('div');
+                    for (const p of panels) {
+                        const r = p.getBoundingClientRect();
+                        if (r.left > 700 && r.height > 300 && p.scrollHeight > p.clientHeight) {
+                            p.scrollBy(0, 600);
+                        }
+                    }
+                }""")
+                await page.wait_for_timeout(500)
+            except Exception:
+                pass
+            clicked = await click_action_by_text(page, action_name)
+
+        if not clicked:
+            print("NOT FOUND on page")
+            page.remove_listener("response", handler)
             continue
 
-        # Wait for video from CDN (up to 6 seconds)
+        # --- Wait up to 10 seconds for CDN video response ---
         try:
-            await asyncio.wait_for(event.wait(), timeout=6.0)
+            await asyncio.wait_for(capture_event.wait(), timeout=10.0)
         except asyncio.TimeoutError:
-            # Fallback: check DOM video element
+            # Fallback: check video element in DOM
             try:
-                src = await page.evaluate("""
-                    () => {
-                        const v = document.querySelector('video');
-                        return v ? (v.src || v.currentSrc || '') : '';
-                    }
-                """)
+                src = await page.evaluate("""() => {
+                    const v = document.querySelector('video');
+                    return v ? (v.src || v.currentSrc || '') : '';
+                }""")
                 if src and is_cdn_video(src):
-                    captured_url = src
+                    captured_ref["url"] = src
             except Exception:
                 pass
 
-        page.remove_listener("response", on_resp)
+        page.remove_listener("response", handler)
+        captured_url = captured_ref["url"]
 
         if captured_url:
-            print("video found!")
-            download(captured_url, dest, cookies)
-            downloaded += 1
+            short = captured_url.split("?")[0].split("/")[-1]
+            print(f"-> {short}")
+            if download(captured_url, dest, cookies):
+                ok_count += 1
         else:
-            print("no video (paid?) -- dismissing popup")
+            print("no video (10s timeout)")
             await dismiss_popups(page)
 
-        await page.wait_for_timeout(2000)
+        # --- Pause before next action ---
+        await page.wait_for_timeout(1500)
 
-    print(f"\n  {char_name}: {downloaded}/{len(rows)} videos downloaded")
+    print(f"\n  {char_name}: {ok_count}/{len(actions)} downloaded")
 
 
 async def main():
@@ -317,8 +387,8 @@ async def main():
         print("=" * 60)
 
         page = await ctx.new_page()
-        for slug, name in CHARACTERS:
-            await scrape_character(page, slug, name, cookies)
+        for slug, name, actions in CHARACTERS:
+            await scrape_character(page, slug, name, actions, cookies)
         await page.close()
 
         await browser.close()
