@@ -2,8 +2,7 @@
 """
 Candy.ai Live Action Scraper
 
-For each character: navigate to /live-actions, click each request by name,
-intercept the video from private-cdn.candy.ai/videos/, download it.
+Flow per action: click -> video plays fully -> download -> next
 """
 
 import asyncio
@@ -13,7 +12,7 @@ import requests
 from playwright.async_api import async_playwright, Page, Response
 
 BASE_URL = "https://candy.ai"
-OUTPUT_DIR = Path.home() / "Desktop" / "Live Action 2"
+OUTPUT_DIR = Path.home() / "Desktop" / "Live Action 3"
 
 CHARACTERS = [
     ("coco-bailey", "Coco", [
@@ -72,7 +71,7 @@ CHARACTERS = [
 ]
 
 VIDEO_CONTENT_TYPES = {"video/mp4", "video/webm", "application/octet-stream"}
-MIN_VIDEO_SIZE = 200 * 1024
+MIN_VIDEO_SIZE = 2 * 1024 * 1024  # 2 MB minimum for a valid video
 
 
 def slugify(text):
@@ -97,7 +96,7 @@ def download(url, dest, cookies):
             "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                           "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "Referer": BASE_URL + "/",
-        }, stream=True, timeout=120)
+        }, stream=True, timeout=180)
         r.raise_for_status()
         with open(dest, "wb") as f:
             for chunk in r.iter_content(8192):
@@ -113,40 +112,35 @@ def download(url, dest, cookies):
 
 
 async def click_action_by_text(page, action_name):
-    """Find and click a request row by its action text in the right panel."""
     coords = await page.evaluate("""
         (actionName) => {
-            const normalizedTarget = actionName.toLowerCase().trim();
+            const target = actionName.toLowerCase().trim();
             const allElements = document.querySelectorAll('div, button, a, li, span');
-            let bestMatch = null;
+            let best = null;
             let bestArea = Infinity;
 
             for (const el of allElements) {
                 const rect = el.getBoundingClientRect();
                 if (rect.left < 700) continue;
-                if (rect.width < 200 || rect.height < 30) continue;
-                if (rect.height > 80) continue;
+                if (rect.width < 200 || rect.height < 30 || rect.height > 80) continue;
 
-                const rawText = el.textContent.trim();
-                const normalized = rawText.toLowerCase()
+                const raw = el.textContent.trim();
+                const norm = raw.toLowerCase()
                     .replace(/free$/i, '').replace(/request$/i, '')
                     .replace(/\\d+$/, '').trim();
 
-                if (normalized === normalizedTarget ||
-                    normalized.startsWith(normalizedTarget) ||
-                    normalizedTarget.startsWith(normalized)) {
+                if (norm === target || norm.startsWith(target) || target.startsWith(norm)) {
                     const area = rect.width * rect.height;
                     if (area < bestArea) {
                         bestArea = area;
-                        bestMatch = {
+                        best = {
                             x: Math.round(rect.x + rect.width / 2),
                             y: Math.round(rect.y + rect.height / 2),
-                            found: rawText.substring(0, 50)
                         };
                     }
                 }
             }
-            return bestMatch;
+            return best;
         }
     """, action_name)
 
@@ -157,8 +151,7 @@ async def click_action_by_text(page, action_name):
 
 
 async def scroll_and_click(page, action_name):
-    """Try to find and click an action, scrolling the right panel if needed."""
-    # Reset scroll to top
+    # Reset scroll
     try:
         await page.evaluate("""() => {
             document.querySelectorAll('div').forEach(p => {
@@ -174,16 +167,15 @@ async def scroll_and_click(page, action_name):
     if await click_action_by_text(page, action_name):
         return True
 
-    # Scroll down in increments to find the action
-    for scroll_amount in [300, 300, 300, 300]:
+    for _ in range(4):
         try:
-            await page.evaluate("""(px) => {
+            await page.evaluate("""() => {
                 document.querySelectorAll('div').forEach(p => {
                     const r = p.getBoundingClientRect();
                     if (r.left > 700 && r.height > 300 && p.scrollHeight > p.clientHeight)
-                        p.scrollBy(0, px);
+                        p.scrollBy(0, 300);
                 });
-            }""", scroll_amount)
+            }""")
             await page.wait_for_timeout(400)
         except Exception:
             pass
@@ -193,16 +185,69 @@ async def scroll_and_click(page, action_name):
     return False
 
 
+async def wait_for_video_to_finish(page, timeout_s=120):
+    """
+    Wait for the <video> element to finish playing.
+    Polls every 1s checking currentTime vs duration.
+    Does NOT modify the video element in any way.
+    """
+    # First wait a moment for the video to start loading
+    await page.wait_for_timeout(2000)
+
+    for i in range(timeout_s):
+        try:
+            state = await page.evaluate("""() => {
+                const v = document.querySelector('video');
+                if (!v) return { status: 'no_video' };
+                if (v.ended) return { status: 'ended', duration: v.duration };
+                if (v.readyState < 2) return { status: 'loading' };
+                if (v.paused && v.currentTime > 0) return { status: 'ended', duration: v.duration };
+                return {
+                    status: 'playing',
+                    current: v.currentTime,
+                    duration: v.duration || 0,
+                };
+            }""")
+
+            status = state.get("status", "unknown")
+
+            if status == "ended":
+                dur = state.get("duration", 0)
+                print(f"finished ({dur:.0f}s)!", flush=True)
+                return True
+
+            if status == "playing":
+                cur = state.get("current", 0)
+                dur = state.get("duration", 0)
+                if dur > 0 and cur >= dur - 0.5:
+                    print(f"finished ({dur:.0f}s)!", flush=True)
+                    return True
+                # Show progress every 5 seconds
+                if i > 0 and i % 5 == 0:
+                    print(f"{cur:.0f}/{dur:.0f}s", end=" ", flush=True)
+
+            if status == "no_video":
+                if i > 10:
+                    print("no video element", flush=True)
+                    return False
+
+        except Exception:
+            pass
+
+        await page.wait_for_timeout(1000)
+
+    print(f"timeout ({timeout_s}s)", flush=True)
+    return False
+
+
 async def dismiss_popups(page):
-    """Try to close any popup that might have appeared."""
     try:
         await page.keyboard.press("Escape")
         await page.wait_for_timeout(500)
     except Exception:
         pass
     for sel in ["button:has-text('Close')", "button:has-text('Cancel')",
-                "button:has-text('No thanks')", "button:has-text('Maybe later')",
-                "[aria-label='Close']"]:
+                "button:has-text('No thanks')", "[aria-label='Close']"]:
         try:
             loc = page.locator(sel).first
             if await loc.is_visible(timeout=300):
@@ -240,7 +285,7 @@ async def scrape_character(page, slug, char_name, actions, cookies):
             if await loc.is_visible(timeout=3000):
                 await loc.click(timeout=5000)
                 print(f"  Clicked '{pat}'")
-                await page.wait_for_timeout(4000)
+                await page.wait_for_timeout(5000)
                 break
         except Exception:
             continue
@@ -259,7 +304,7 @@ async def scrape_character(page, slug, char_name, actions, cookies):
 
         print(f"  [{idx+1}/{len(actions)}] {action_name}")
 
-        # --- Set up interceptor BEFORE clicking ---
+        # --- Interceptor BEFORE clicking ---
         capture_event = asyncio.Event()
 
         def make_handler(evt):
@@ -274,7 +319,7 @@ async def scrape_character(page, slug, char_name, actions, cookies):
                 try:
                     ct = resp.headers.get("content-type", "")
                     cl = resp.headers.get("content-length", "0")
-                    if ct in VIDEO_CONTENT_TYPES or int(cl) > MIN_VIDEO_SIZE:
+                    if ct in VIDEO_CONTENT_TYPES or int(cl) > 200000:
                         captured["url"] = u
                         evt.set()
                 except Exception:
@@ -287,52 +332,54 @@ async def scrape_character(page, slug, char_name, actions, cookies):
         handler, captured_ref = make_handler(capture_event)
         page.on("response", handler)
 
-        # --- Scroll + click ---
+        # --- Click the action ---
         clicked = await scroll_and_click(page, action_name)
         if not clicked:
             print(f"      NOT FOUND on page")
             page.remove_listener("response", handler)
             continue
 
-        # --- Wait up to 120s for CDN video URL ---
-        # The video URL should appear quickly (2-10s) but we give plenty of time.
-        # We poll every 2 seconds and also check the DOM video src as fallback.
-        captured_url = None
-        for attempt in range(60):  # 60 * 2s = 120s max
-            if capture_event.is_set():
-                captured_url = captured_ref["url"]
-                break
-            # Also check DOM fallback every iteration
+        # --- Wait for CDN URL (up to 30s) ---
+        print(f"      waiting for video URL...", end=" ", flush=True)
+        try:
+            await asyncio.wait_for(capture_event.wait(), timeout=30.0)
+        except asyncio.TimeoutError:
+            # DOM fallback
             try:
                 src = await page.evaluate("""() => {
                     const v = document.querySelector('video');
                     return v ? (v.src || v.currentSrc || '') : '';
                 }""")
-                if src and is_cdn_video(src) and src != captured_ref.get("last_src"):
-                    captured_ref["last_src"] = src
-                    captured_url = src
-                    break
+                if src and is_cdn_video(src):
+                    captured_ref["url"] = src
             except Exception:
                 pass
+
+        captured_url = captured_ref["url"]
+
+        if not captured_url:
+            print("no URL found")
+            page.remove_listener("response", handler)
+            await dismiss_popups(page)
             await page.wait_for_timeout(2000)
+            continue
+
+        short = captured_url.split("?")[0].split("/")[-1]
+        print(f"got it ({short})")
+
+        # --- Wait for video to FINISH PLAYING ---
+        print(f"      playing: ", end="", flush=True)
+        await wait_for_video_to_finish(page, timeout_s=120)
 
         page.remove_listener("response", handler)
 
-        # If interceptor got it, prefer that
-        if captured_ref["url"]:
-            captured_url = captured_ref["url"]
+        # --- Now download the complete video ---
+        print(f"      downloading...", end=" ", flush=True)
+        if download(captured_url, dest, cookies):
+            ok_count += 1
 
-        if captured_url:
-            short = captured_url.split("?")[0].split("/")[-1]
-            print(f"      URL: {short}")
-            if download(captured_url, dest, cookies):
-                ok_count += 1
-        else:
-            print(f"      no video after 120s")
-            await dismiss_popups(page)
-
-        # --- Wait between actions ---
-        await page.wait_for_timeout(3000)
+        # --- Brief pause before next action ---
+        await page.wait_for_timeout(2000)
 
     print(f"\n  {char_name}: {ok_count}/{len(actions)} downloaded")
 
