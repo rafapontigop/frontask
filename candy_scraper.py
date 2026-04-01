@@ -2,7 +2,8 @@
 """
 Candy.ai Live Action Scraper
 
-Flow per action: click -> video plays fully -> download -> next
+Flow: click -> video plays fully -> download the LONGEST video -> next
+Ignores the short idle/loop video that plays after each action ends.
 """
 
 import asyncio
@@ -12,7 +13,7 @@ import requests
 from playwright.async_api import async_playwright, Page, Response
 
 BASE_URL = "https://candy.ai"
-OUTPUT_DIR = Path.home() / "Desktop" / "Live Action 3"
+OUTPUT_DIR = Path.home() / "Desktop" / "Live Action 4"
 
 CHARACTERS = [
     ("coco-bailey", "Coco", [
@@ -71,7 +72,7 @@ CHARACTERS = [
 ]
 
 VIDEO_CONTENT_TYPES = {"video/mp4", "video/webm", "application/octet-stream"}
-MIN_VIDEO_SIZE = 2 * 1024 * 1024  # 2 MB minimum for a valid video
+MIN_VIDEO_SIZE = 2 * 1024 * 1024  # 2 MB — real action videos are 2-4 MB
 
 
 def slugify(text):
@@ -81,6 +82,22 @@ def slugify(text):
 
 def is_cdn_video(url):
     return "private-cdn.candy.ai/videos/" in url or "cdn.candy.ai/" in url
+
+
+def get_content_length(url, cookies):
+    """HEAD request to get file size without downloading."""
+    s = requests.Session()
+    for k, v in cookies.items():
+        s.cookies.set(k, v)
+    try:
+        r = s.head(url, headers={
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                          "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Referer": BASE_URL + "/",
+        }, timeout=15, allow_redirects=True)
+        return int(r.headers.get("content-length", 0))
+    except Exception:
+        return 0
 
 
 def download(url, dest, cookies):
@@ -102,6 +119,10 @@ def download(url, dest, cookies):
             for chunk in r.iter_content(8192):
                 f.write(chunk)
         mb = dest.stat().st_size / (1024 * 1024)
+        if mb < 1.5:
+            print(f"      [TOO SMALL] {dest.name} ({mb:.1f} MB) - likely idle loop, removing")
+            dest.unlink()
+            return False
         print(f"      [OK] {dest.name} ({mb:.1f} MB)")
         return True
     except Exception as e:
@@ -151,7 +172,6 @@ async def click_action_by_text(page, action_name):
 
 
 async def scroll_and_click(page, action_name):
-    # Reset scroll
     try:
         await page.evaluate("""() => {
             document.querySelectorAll('div').forEach(p => {
@@ -185,59 +205,82 @@ async def scroll_and_click(page, action_name):
     return False
 
 
-async def wait_for_video_to_finish(page, timeout_s=120):
+async def wait_for_video_end(page, timeout_s=120):
     """
-    Wait for the <video> element to finish playing.
-    Polls every 1s checking currentTime vs duration.
-    Does NOT modify the video element in any way.
+    Wait for the action video to finish playing.
+    The video has ended when:
+    - v.ended is true, OR
+    - v.paused and currentTime > 0, OR
+    - currentTime >= duration - 0.5
+    Does NOT touch the video element. Read-only polling.
     """
-    # First wait a moment for the video to start loading
-    await page.wait_for_timeout(2000)
+    await page.wait_for_timeout(3000)  # let video start loading/playing
+
+    last_current = -1
+    stuck_count = 0
 
     for i in range(timeout_s):
         try:
             state = await page.evaluate("""() => {
                 const v = document.querySelector('video');
                 if (!v) return { status: 'no_video' };
-                if (v.ended) return { status: 'ended', duration: v.duration };
-                if (v.readyState < 2) return { status: 'loading' };
-                if (v.paused && v.currentTime > 0) return { status: 'ended', duration: v.duration };
                 return {
-                    status: 'playing',
+                    ended: v.ended,
+                    paused: v.paused,
                     current: v.currentTime,
                     duration: v.duration || 0,
+                    readyState: v.readyState,
+                    src: (v.src || v.currentSrc || '').substring(0, 80),
                 };
             }""")
 
-            status = state.get("status", "unknown")
+            if state.get("status") == "no_video":
+                if i > 15:
+                    return
+                await page.wait_for_timeout(1000)
+                continue
 
-            if status == "ended":
-                dur = state.get("duration", 0)
-                print(f"finished ({dur:.0f}s)!", flush=True)
-                return True
+            current = state.get("current", 0)
+            duration = state.get("duration", 0)
+            ended = state.get("ended", False)
+            paused = state.get("paused", False)
 
-            if status == "playing":
-                cur = state.get("current", 0)
-                dur = state.get("duration", 0)
-                if dur > 0 and cur >= dur - 0.5:
-                    print(f"finished ({dur:.0f}s)!", flush=True)
-                    return True
-                # Show progress every 5 seconds
-                if i > 0 and i % 5 == 0:
-                    print(f"{cur:.0f}/{dur:.0f}s", end=" ", flush=True)
+            # Video ended naturally
+            if ended:
+                print(f"ended ({duration:.0f}s)", end=" ", flush=True)
+                return
 
-            if status == "no_video":
-                if i > 10:
-                    print("no video element", flush=True)
-                    return False
+            # Video finished (currentTime reached duration)
+            if duration > 5 and current >= duration - 0.5:
+                print(f"complete ({duration:.0f}s)", end=" ", flush=True)
+                return
+
+            # Video paused after playing (some players pause at end instead of 'ended')
+            if paused and current > 5:
+                print(f"paused at {current:.0f}s", end=" ", flush=True)
+                return
+
+            # Show progress every 5s
+            if i > 0 and i % 5 == 0 and duration > 0:
+                print(f"{current:.0f}/{duration:.0f}s", end=" ", flush=True)
+
+            # Detect if playback is stuck
+            if abs(current - last_current) < 0.1:
+                stuck_count += 1
+                if stuck_count > 15 and current > 3:
+                    # Stuck for 15s after at least 3s of play = probably done
+                    print(f"stalled at {current:.0f}s", end=" ", flush=True)
+                    return
+            else:
+                stuck_count = 0
+            last_current = current
 
         except Exception:
             pass
 
         await page.wait_for_timeout(1000)
 
-    print(f"timeout ({timeout_s}s)", flush=True)
-    return False
+    print(f"timeout", end=" ", flush=True)
 
 
 async def dismiss_popups(page):
@@ -278,7 +321,7 @@ async def scrape_character(page, slug, char_name, actions, cookies):
 
     await page.wait_for_timeout(4000)
 
-    # Click "Tap to start" if present
+    # Click "Tap to start"
     for pat in ["Tap to start", "TAP TO START"]:
         try:
             loc = page.get_by_text(pat, exact=False).first
@@ -304,81 +347,83 @@ async def scrape_character(page, slug, char_name, actions, cookies):
 
         print(f"  [{idx+1}/{len(actions)}] {action_name}")
 
-        # --- Interceptor BEFORE clicking ---
-        capture_event = asyncio.Event()
+        # --- Collect ALL CDN video URLs after clicking (not just the first) ---
+        collected_urls = []
 
-        def make_handler(evt):
-            captured = {"url": None}
+        def make_handler():
+            urls = []
 
             async def handler(resp):
-                if captured["url"]:
-                    return
                 u = resp.url
                 if not is_cdn_video(u):
                     return
                 try:
                     ct = resp.headers.get("content-type", "")
-                    cl = resp.headers.get("content-length", "0")
-                    if ct in VIDEO_CONTENT_TYPES or int(cl) > 200000:
-                        captured["url"] = u
-                        evt.set()
+                    cl = int(resp.headers.get("content-length", "0"))
+                    if ct in VIDEO_CONTENT_TYPES or cl > 100000:
+                        urls.append({"url": u, "size": cl})
                 except Exception:
                     if "/videos/" in u:
-                        captured["url"] = u
-                        evt.set()
+                        urls.append({"url": u, "size": 0})
 
-            return handler, captured
+            return handler, urls
 
-        handler, captured_ref = make_handler(capture_event)
+        handler, collected_urls = make_handler()
         page.on("response", handler)
 
-        # --- Click the action ---
+        # --- Click ---
         clicked = await scroll_and_click(page, action_name)
         if not clicked:
             print(f"      NOT FOUND on page")
             page.remove_listener("response", handler)
             continue
 
-        # --- Wait for CDN URL (up to 30s) ---
-        print(f"      waiting for video URL...", end=" ", flush=True)
-        try:
-            await asyncio.wait_for(capture_event.wait(), timeout=30.0)
-        except asyncio.TimeoutError:
-            # DOM fallback
+        # --- Wait for the action video to fully play ---
+        print(f"      playing: ", end="", flush=True)
+        await wait_for_video_end(page, timeout_s=120)
+        print()  # newline after progress
+
+        # --- Wait a moment for the idle loop to start (its URL also gets captured) ---
+        await page.wait_for_timeout(3000)
+
+        page.remove_listener("response", handler)
+
+        # --- Pick the BIGGEST video URL (action video >> idle loop) ---
+        if not collected_urls:
+            # Last resort: check DOM
             try:
                 src = await page.evaluate("""() => {
                     const v = document.querySelector('video');
                     return v ? (v.src || v.currentSrc || '') : '';
                 }""")
                 if src and is_cdn_video(src):
-                    captured_ref["url"] = src
+                    collected_urls.append({"url": src, "size": 0})
             except Exception:
                 pass
 
-        captured_url = captured_ref["url"]
-
-        if not captured_url:
-            print("no URL found")
-            page.remove_listener("response", handler)
+        if not collected_urls:
+            print(f"      no video URLs captured")
             await dismiss_popups(page)
             await page.wait_for_timeout(2000)
             continue
 
-        short = captured_url.split("?")[0].split("/")[-1]
-        print(f"got it ({short})")
+        # Check actual sizes via HEAD for URLs without content-length
+        print(f"      captured {len(collected_urls)} CDN URLs, picking largest...")
+        for entry in collected_urls:
+            if entry["size"] == 0:
+                entry["size"] = get_content_length(entry["url"], cookies)
 
-        # --- Wait for video to FINISH PLAYING ---
-        print(f"      playing: ", end="", flush=True)
-        await wait_for_video_to_finish(page, timeout_s=120)
+        # Sort by size descending, pick the biggest
+        collected_urls.sort(key=lambda x: x["size"], reverse=True)
+        best = collected_urls[0]
+        best_mb = best["size"] / (1024 * 1024)
+        short = best["url"].split("?")[0].split("/")[-1]
+        print(f"      best: {short} ({best_mb:.1f} MB)")
 
-        page.remove_listener("response", handler)
-
-        # --- Now download the complete video ---
-        print(f"      downloading...", end=" ", flush=True)
-        if download(captured_url, dest, cookies):
+        # --- Download ---
+        if download(best["url"], dest, cookies):
             ok_count += 1
 
-        # --- Brief pause before next action ---
         await page.wait_for_timeout(2000)
 
     print(f"\n  {char_name}: {ok_count}/{len(actions)} downloaded")
