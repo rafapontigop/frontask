@@ -257,16 +257,6 @@ async def scrape_character(page, slug, char_name, actions, cookies):
         handler, captured_ref = make_handler(capture_event)
         page.on("response", handler)
 
-        # --- Reset video player ---
-        try:
-            await page.evaluate("""() => {
-                document.querySelectorAll('video').forEach(v => {
-                    v.pause(); v.removeAttribute('src'); v.load();
-                });
-            }""")
-        except Exception:
-            pass
-
         # --- Scroll the action into view and click it ---
         # First scroll the right panel to top to reset
         try:
@@ -324,9 +314,9 @@ async def scrape_character(page, slug, char_name, actions, cookies):
             page.remove_listener("response", handler)
             continue
 
-        # --- Wait up to 120s for CDN video response ---
+        # --- Wait up to 15s for CDN video URL to appear in network ---
         try:
-            await asyncio.wait_for(capture_event.wait(), timeout=120.0)
+            await asyncio.wait_for(capture_event.wait(), timeout=15.0)
         except asyncio.TimeoutError:
             # Fallback: check video element in DOM
             try:
@@ -345,61 +335,16 @@ async def scrape_character(page, slug, char_name, actions, cookies):
         if captured_url:
             short = captured_url.split("?")[0].split("/")[-1]
             print(f"-> {short}")
-
-            # --- Wait for the video to finish playing before downloading ---
-            print(f"      waiting for video to finish playing...", end=" ", flush=True)
-            try:
-                await page.evaluate("""() => {
-                    return new Promise((resolve) => {
-                        const v = document.querySelector('video');
-                        if (!v) { resolve(); return; }
-
-                        // If video already ended
-                        if (v.ended) { resolve(); return; }
-
-                        // If video has no src (shouldn't happen but safety)
-                        if (!v.src && !v.currentSrc) { resolve(); return; }
-
-                        // Wait for 'ended' event
-                        v.addEventListener('ended', () => resolve(), { once: true });
-
-                        // Safety: also resolve if video errors out
-                        v.addEventListener('error', () => resolve(), { once: true });
-                    });
-                }""")
-                print("done!")
-            except Exception:
-                # Fallback: poll currentTime vs duration for up to 3 minutes
-                print("(polling fallback)...", end=" ", flush=True)
-                for _ in range(180):  # 180 * 1s = 3 minutes max
-                    try:
-                        state = await page.evaluate("""() => {
-                            const v = document.querySelector('video');
-                            if (!v) return { done: true };
-                            if (v.ended) return { done: true };
-                            if (v.duration && v.currentTime >= v.duration - 0.5)
-                                return { done: true };
-                            return {
-                                done: false,
-                                current: Math.round(v.currentTime),
-                                total: Math.round(v.duration || 0)
-                            };
-                        }""")
-                        if state.get("done"):
-                            break
-                    except Exception:
-                        break
-                    await page.wait_for_timeout(1000)
-                print("done!")
-
             if download(captured_url, dest, cookies):
                 ok_count += 1
         else:
-            print("no video (120s timeout)")
+            print("no video (timeout)")
             await dismiss_popups(page)
 
-        # --- Pause before next action ---
-        await page.wait_for_timeout(2000)
+        # --- Wait for video to finish playing before clicking next ---
+        # The CDN URL is already captured/downloaded above. Now we just
+        # need to let the player finish so the next click works properly.
+        await page.wait_for_timeout(3000)
 
     print(f"\n  {char_name}: {ok_count}/{len(actions)} downloaded")
 
